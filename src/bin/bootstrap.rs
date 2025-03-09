@@ -20,12 +20,13 @@ struct Behaviour {
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn Error>> {
     println!("Starting program...");
-    // set keypair and value
     let keypair = identity::Keypair::generate_ed25519();
     let peer_id = PeerId::from(keypair.public());
     println!("Bootstrap Node peer id: {:?}", peer_id);
 
-    // set Swarm
+    std::fs::write("bootstrap_peer_id", peer_id.to_string())
+        .expect("Failed to write bootstrap peer ID to file");
+
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -34,11 +35,10 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             yamux::Config::default,
         )?
         .with_behaviour(|_| {
+            let mut kad = kad::Behaviour::new(peer_id, MemoryStore::new(peer_id));
+            kad.set_mode(Some(kad::Mode::Server));
             Ok(Behaviour {
-                kademlia: kad::Behaviour::new(
-                    peer_id,                   // Use peer's ID for the DHT
-                    MemoryStore::new(peer_id), // Store DHT data in-memory
-                ),
+                kademlia: kad,
                 ping: ping::Behaviour::default(),
             })
         })?
@@ -46,39 +46,40 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             cfg.with_idle_connection_timeout(Duration::from_secs(u64::MAX))
         })
         .build();
+
     let listen_addr: Multiaddr = "/ip4/0.0.0.0/tcp/50000".parse()?;
     swarm.listen_on(listen_addr.clone())?;
-
     println!("Bootstrap node running at: {:?}", listen_addr);
 
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-
     loop {
-        tokio::select! {
-            // Handle shutdown signal
-            _ = shutdown_rx.recv() => {
-                println!("Shutting down bootstrap node...");
-                break;
+        match swarm.select_next_some().await {
+            SwarmEvent::NewListenAddr { address, .. } => {
+                println!("Bootstrap node listening on: {:?}", address);
             }
-            // Handle events emitted by the Swarm
-            event = swarm.select_next_some() => {
-                match event {
-                    // Print a message when a peer connects
-                     SwarmEvent::Behaviour(BehaviourEvent::Kademlia(kad::Event::RoutingUpdated { peer, .. })) => {
-                        println!("Peer connected: {:?}", peer);
-                    }
-                    // Handle when the node starts listening on an address
-                    SwarmEvent::NewListenAddr { address, .. } => {
-                        println!("Listening on: {:?}", address);
-                    }
-                    SwarmEvent::Behaviour(event) => println!("Event received from peer is {:?}", event),
+            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                println!("Connection established with peer: {:?}", peer_id);
+                // Add the peer to the DHT
+                swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, listen_addr.clone());
+                // Start a FindNode query for the new peer
+                swarm.behaviour_mut().kademlia.get_closest_peers(peer_id);
 
-                    // Catch-all pattern to handle any other events
-                    _ => {}
+                let key = kad::RecordKey::new(&peer_id.to_bytes());
+
+                if let Err(e) = swarm.behaviour_mut().kademlia.start_providing(key) {
+                    println!("Failed to advertise peer: {:?}", e);
                 }
             }
+            SwarmEvent::Behaviour(BehaviourEvent::Kademlia(kad::Event::RoutingUpdated {
+                peer,
+                ..
+            })) => {
+                println!("Routing table updated for peer: {:?}", peer);
+            }
+            SwarmEvent::Behaviour(event) => println!("Event received: {:?}", event),
+            _ => {}
         }
     }
-
-    Ok(())
 }
